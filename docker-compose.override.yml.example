@@ -1,0 +1,75 @@
+# Development override for docker-compose
+# Copy to docker-compose.override.yml and customize
+
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - TIGER_DATABASE_URL=${TIGER_DATABASE_URL}
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY}
+      - GITHUB_APP_ID=${GITHUB_APP_ID}
+      - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET}
+      - GITHUB_PRIVATE_KEY_PATH=/app/github-app-private-key.pem
+      - DEBUG=true
+    volumes:
+      - ./backend:/app/backend
+      - ./github-app-private-key.pem:/app/github-app-private-key.pem:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - TIGER_DATABASE_URL=${TIGER_DATABASE_URL}
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY}
+      - GITHUB_APP_ID=${GITHUB_APP_ID}
+      - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET}
+      - GITHUB_PRIVATE_KEY_PATH=/app/github-app-private-key.pem
+      - DEBUG=true
+    volumes:
+      - ./backend:/app/backend
+      - ./github-app-private-key.pem:/app/github-app-private-key.pem:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: arq backend.job_queue.WorkerSettings
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    command: npm run dev
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  redis_data:
