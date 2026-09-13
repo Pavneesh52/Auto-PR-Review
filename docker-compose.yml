@@ -1,0 +1,60 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    ports:
+      # Host port 5433: 5432 is commonly already taken by a native Postgres
+      # install. Inside the compose network Postgres is still on 5432.
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: pr_agent
+      POSTGRES_PASSWORD: pr_agent_secret
+      POSTGRES_DB: pr_review_agent
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pr_agent -d pr_review_agent"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file: .env
+    # These override the host-oriented values in .env: inside the compose
+    # network Postgres is reached by service name on its native port, so a
+    # .env pointing at localhost:5433 (or a conflicting native Postgres on
+    # the host) has no effect on the container.
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql+asyncpg://pr_agent:pr_agent_secret@postgres:5432/pr_review_agent
+      - DATABASE_URL_SYNC=postgresql://pr_agent:pr_agent_secret@postgres:5432/pr_review_agent
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+volumes:
+  redis_data:
+  postgres_data:

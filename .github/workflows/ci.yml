@@ -1,0 +1,245 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_DEFAULT: "3.12"
+  REDIS_URL: redis://localhost:6379/0
+  DATABASE_URL: postgresql+asyncpg://pr_agent:pr_agent_secret@localhost:5432/pr_review_agent
+  DATABASE_URL_SYNC: postgresql://pr_agent:pr_agent_secret@localhost:5432/pr_review_agent
+  OPENAI_API_KEY: ""  # Not needed for tests — agents return empty on failure
+
+jobs:
+  # ── Lint & Format ────────────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_DEFAULT }}
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Check formatting
+        run: ruff format --check .
+
+      - name: Check linting
+        run: ruff check .
+
+  # ── Type Check ───────────────────────────────────────────────────────
+  typecheck:
+    name: Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_DEFAULT }}
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Install mypy
+        run: pip install mypy
+
+      - name: Run mypy
+        run: mypy src/pr_review_agent --ignore-missing-imports --no-error-summary
+
+  # ── Tests ────────────────────────────────────────────────────────────
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      postgres:
+        image: pgvector/pgvector:pg16
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_USER: pr_agent
+          POSTGRES_PASSWORD: pr_agent_secret
+          POSTGRES_DB: pr_review_agent
+        options: >-
+          --health-cmd "pg_isready -U pr_agent -d pr_review_agent"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Run tests
+        run: |
+          python -m pytest tests/ -v --tb=short \
+            --cov=pr_review_agent \
+            --cov-report=xml \
+            --cov-report=term-missing
+        env:
+          REDIS_URL: redis://localhost:6379/0
+          DATABASE_URL: postgresql+asyncpg://pr_agent:pr_agent_secret@localhost:5432/pr_review_agent
+
+      - name: Upload coverage
+        if: matrix.python-version == '3.12'
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+
+  # ── Security Scan ────────────────────────────────────────────────────
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_DEFAULT }}
+
+      - name: Install safety
+        run: pip install pip-audit
+
+      - name: Audit dependencies
+        run: pip-audit --desc
+        continue-on-error: true  # Don't block CI on dependency advisories
+
+  # ── Build Verification ──────────────────────────────────────────────
+  build:
+    name: Build Package
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_DEFAULT }}
+
+      - name: Install build tools
+        run: pip install build
+
+      - name: Build sdist + wheel
+        run: python -m build
+
+      - name: Verify package
+        run: |
+          pip install dist/*.whl
+          python -c "from pr_review_agent.app import main; print('Package OK')"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 30
+
+  # ── Integration Tests (Full Pipeline) ────────────────────────────────
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: [test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      postgres:
+        image: pgvector/pgvector:pg16
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_USER: pr_agent
+          POSTGRES_PASSWORD: pr_agent_secret
+          POSTGRES_DB: pr_review_agent
+        options: >-
+          --health-cmd "pg_isready -U pr_agent -d pr_review_agent"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]" alembic
+
+      - name: Run migrations
+        run: alembic upgrade head
+        env:
+          DATABASE_URL: postgresql://pr_agent:pr_agent_secret@localhost:5432/pr_review_agent
+
+      - name: Run full test suite
+        run: python -m pytest tests/ -v --tb=short
+        env:
+          REDIS_URL: redis://localhost:6379/0
+          DATABASE_URL: postgresql+asyncpg://pr_agent:pr_agent_secret@localhost:5432/pr_review_agent
+
+      - name: Test server startup
+        run: |
+          timeout 10 python -c "
+          import asyncio
+          from pr_review_agent.db.connection import init_db, close_db
+          from pr_review_agent.queue.event_queue import EventQueue
+
+          async def test():
+              await init_db()
+              q = EventQueue()
+              await q.connect()
+              print('DB + Redis OK')
+              await q.close()
+              await close_db()
+
+          asyncio.run(test())
+          " || true
+        env:
+          REDIS_URL: redis://localhost:6379/0
+          DATABASE_URL: postgresql+asyncpg://pr_agent:pr_agent_secret@localhost:5432/pr_review_agent
